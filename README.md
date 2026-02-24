@@ -46,3 +46,10 @@ pi install npm:@jademind/pi-visual
 3. ask assistant to output the payload exactly
 4. run `/pi-visualize`
 5. open `.pi/visual-cache/latest.json`
+
+## OSS best practices
+
+- Keep install docs scoped: `pi install npm:@jademind/pi-visual`.
+- Keep cache writes constrained to `.pi/visual-cache` and use atomic writes for state files.
+- Treat Mermaid/chart rendering as best-effort and non-fatal so core UX remains stable.
+- Document command-surface changes clearly when pruning or renaming commands.

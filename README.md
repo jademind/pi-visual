@@ -20,8 +20,8 @@ Advanced visualization and rendering for Pi output.
 
 ## Commands
 
-- `/pi-visualize` — toggle live visualization on/off
-- `/pi-visual` — alias
+- `/pi-visualize [on|off|toggle]` — enable live visualization (default `on`)
+- `/pi-visual [on|off|toggle]` — alias
 - `/pi-visual-clear`
 - `/pi-visual-widget`
 

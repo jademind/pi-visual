@@ -26,8 +26,8 @@ Minimal Pi extension for visual enrichment of the **latest** output only.
 - Dependencies: minimal (no extra chart libs).
 
 ## Commands (only)
-- `/pi-visualize`
-- `/pi-visual` (alias)
+- `/pi-visualize [on|off|toggle]` (default `on`)
+- `/pi-visual [on|off|toggle]` (alias)
 - `/pi-visual-clear`
 - `/pi-visual-widget`
 - `/pi-visual-test` (prompt template)

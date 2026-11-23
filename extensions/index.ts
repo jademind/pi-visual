@@ -35,6 +35,20 @@ type CustomTextBlock = { type: "text"; text: string };
 type CustomImageBlock = { type: "image"; data: string; mimeType: string };
 type CustomMessageContent = string | Array<CustomTextBlock | CustomImageBlock>;
 
+type MermaidRenderCache = {
+	key?: string;
+	renderedMermaidPath?: string;
+	renderedMermaidPngPath?: string;
+	renderError?: string;
+};
+
+type InlineRenderCache = {
+	markdownKey?: string;
+	markdownPngPath?: string;
+	chartKey?: string;
+	chartPngPath?: string;
+};
+
 const WIDGET_ID = "pi-visual";
 const MAX_CAPTURE_CHARS = 32_000;
 const MAX_MERMAID_BLOCKS = 4;
@@ -52,6 +66,10 @@ const state: {
 		clear: string;
 		widget: string;
 	};
+	renderCache: {
+		mermaid: MermaidRenderCache;
+		inline: InlineRenderCache;
+	};
 } = {
 	widgetEnabled: true,
 	visualizeActive: false,
@@ -60,6 +78,10 @@ const state: {
 		alias: "pi-visual",
 		clear: "pi-visual-clear",
 		widget: "pi-visual-widget",
+	},
+	renderCache: {
+		mermaid: {},
+		inline: {},
 	},
 };
 
@@ -159,12 +181,12 @@ function captureLatest(source: VisualSource, raw: string, ctx: ExtensionContext)
 	const text = clampCapture(raw);
 	if (!text) return false;
 	if (isSelfVisualEnvelope(text)) return false;
-	const hash = createHash("sha256").update(text).digest("hex");
+	const hash = hashText(text);
 	if (hash === state.lastHash) return false;
 
 	const mermaidBlocks = extractMermaidBlocks(text);
 	if (!hasVisualSignal(text, mermaidBlocks)) return false;
-	if (source === "tool" && state.latest) {
+	if (state.latest) {
 		const prevScore = visualScore(state.latest.text, state.latest.mermaidBlocks);
 		const nextScore = visualScore(text, mermaidBlocks);
 		if (nextScore < prevScore) return false;
@@ -205,6 +227,10 @@ async function resolveMmdcCommand(cwd: string): Promise<{ cmd: string; argsPrefi
 	}
 }
 
+function hashText(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
 function escapeXml(text: string): string {
 	return text
 		.replaceAll("&", "&amp;")
@@ -214,20 +240,47 @@ function escapeXml(text: string): string {
 		.replaceAll("'", "&#39;");
 }
 
+async function fileExists(filePath: string | undefined): Promise<boolean> {
+	if (!filePath) return false;
+	try {
+		await access(filePath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function writeAtomic(pathname: string, content: string): Promise<void> {
 	const tmp = `${pathname}.tmp-${randomUUID()}`;
 	await writeFile(tmp, content, { encoding: "utf8", mode: 0o600 });
 	await rename(tmp, pathname);
 }
 
+function formatMarkdownPreviewLine(line: string): string {
+	let out = line.trim();
+	if (!out) return "";
+
+	out = out
+		.replace(/^#{1,6}\s+/, "")
+		.replace(/^>\s?/, "│ ")
+		.replace(/^[-*+]\s+/, "• ")
+		.replace(/^\d+\.\s+/, "• ")
+		.replace(/\*\*([^*]+)\*\*/g, "$1")
+		.replace(/\*([^*]+)\*/g, "$1")
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/^```(?:\w+)?\s*$/, "")
+		.replace(/<\/?details>|<\/?summary>|<\/?strong>/gi, "");
+
+	return out.trim();
+}
+
 function condensedLines(text: string): string[] {
 	const lines = text
-		.replace(/```mermaid[\s\S]*?```/gi, "[mermaid diagram]")
-		.replace(/```[\s\S]*?```/g, "[code block]")
+		.replace(/```mermaid[\s\S]*?```/gi, "diagram: mermaid block")
 		.split("\n")
-		.map((line) => line.trim())
+		.map(formatMarkdownPreviewLine)
 		.filter(Boolean)
-		.slice(0, 64)
+		.slice(0, 80)
 		.map((line) => (line.length > 150 ? `${line.slice(0, 149)}…` : line));
 	return lines.length > 0 ? lines : ["(empty)"];
 }
@@ -380,20 +433,41 @@ function formatMermaidError(raw: string, mermaidSource: string): string {
 async function renderMermaid(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	if (!state.latest || state.latest.mermaidBlocks.length === 0) return;
 
+	const mermaidSource = state.latest.mermaidBlocks[state.latest.mermaidBlocks.length - 1] ?? "";
+	const mermaidKey = hashText(mermaidSource);
+	const cached = state.renderCache.mermaid;
+	if (
+		cached.key === mermaidKey &&
+		(cached.renderError || (await fileExists(cached.renderedMermaidPath)) || (await fileExists(cached.renderedMermaidPngPath)))
+	) {
+		state.latest.renderedMermaidPath = (await fileExists(cached.renderedMermaidPath)) ? cached.renderedMermaidPath : undefined;
+		state.latest.renderedMermaidPngPath = (await fileExists(cached.renderedMermaidPngPath)) ? cached.renderedMermaidPngPath : undefined;
+		state.latest.renderError = cached.renderError;
+		state.latest.previewPngPath = pickPrimaryPreview(state.latest);
+		return;
+	}
+
 	const cacheDir = path.join(ctx.cwd, ".pi", "visual-cache");
 	await mkdir(cacheDir, { recursive: true });
 	const input = path.join(cacheDir, "latest.mmd");
 	const output = path.join(cacheDir, "latest-mermaid.svg");
 	const pngOutput = path.join(cacheDir, "latest-mermaid.png");
-	await writeFile(input, state.latest.mermaidBlocks[state.latest.mermaidBlocks.length - 1]!, "utf8");
+	await writeFile(input, mermaidSource, "utf8");
 
 	const { cmd, argsPrefix } = await resolveMmdcCommand(ctx.cwd);
 	const result = await pi.exec(cmd, [...argsPrefix, "-i", input, "-o", output], { timeout: 90_000 });
 	if (result.code !== 0) {
 		const rawError = (result.stderr || result.stdout || "Mermaid CLI failed").trim();
-		state.latest.renderError = formatMermaidError(rawError, state.latest.mermaidBlocks[state.latest.mermaidBlocks.length - 1] ?? "");
+		const formatted = formatMermaidError(rawError, mermaidSource);
+		state.latest.renderError = formatted;
 		state.latest.renderedMermaidPath = undefined;
 		state.latest.renderedMermaidPngPath = undefined;
+		state.renderCache.mermaid = {
+			key: mermaidKey,
+			renderedMermaidPath: undefined,
+			renderedMermaidPngPath: undefined,
+			renderError: formatted,
+		};
 		return;
 	}
 
@@ -401,11 +475,13 @@ async function renderMermaid(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	state.latest.renderError = undefined;
 
 	const pngResult = await pi.exec(cmd, [...argsPrefix, "-i", input, "-o", pngOutput], { timeout: 90_000 });
-	if (pngResult.code === 0) {
-		state.latest.renderedMermaidPngPath = pngOutput;
-	} else {
-		state.latest.renderedMermaidPngPath = undefined;
-	}
+	state.latest.renderedMermaidPngPath = pngResult.code === 0 ? pngOutput : undefined;
+	state.renderCache.mermaid = {
+		key: mermaidKey,
+		renderedMermaidPath: output,
+		renderedMermaidPngPath: state.latest.renderedMermaidPngPath,
+		renderError: undefined,
+	};
 	state.latest.previewPngPath = pickPrimaryPreview(state.latest);
 }
 
@@ -473,21 +549,39 @@ async function renderInlineAssets(pi: ExtensionAPI, ctx: ExtensionCommandContext
 	const headerH = 54;
 	const lineH = 22;
 	const lines = condensedLines(state.latest.text);
-	const textH = Math.max(200, lines.length * lineH + 24);
-	const textY = headerH + 24;
-	const textRows = lines
-		.map((line, idx) => `<text x="20" y="${textY + idx * lineH}" fill="#d1d5db" font-size="14" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">${escapeXml(line)}</text>`)
-		.join("");
-	const markdownHeight = textY + textH + 24;
-	const markdownSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${markdownHeight}" viewBox="0 0 ${width} ${markdownHeight}"><rect x="0" y="0" width="${width}" height="${markdownHeight}" fill="#0b1020"/><rect x="0" y="0" width="${width}" height="${headerH}" fill="#111827"/><text x="20" y="34" fill="#e5e7eb" font-size="18" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">pi-visual · markdown</text>${textRows}</svg>`;
+	const markdownKey = hashText(lines.join("\n"));
 	const markdownSvgPath = path.join(cacheDir, "latest-markdown.svg");
 	const markdownPngPath = path.join(cacheDir, "latest-markdown.png");
-	await writeAtomic(markdownSvgPath, markdownSvg);
-	state.latest.markdownPngPath = await convertSvgToPng(pi, ctx, markdownSvgPath, markdownPngPath);
+	if (state.renderCache.inline.markdownKey === markdownKey && (await fileExists(state.renderCache.inline.markdownPngPath))) {
+		state.latest.markdownPngPath = state.renderCache.inline.markdownPngPath;
+	} else {
+		const textH = Math.max(200, lines.length * lineH + 24);
+		const textY = headerH + 24;
+		const textRows = lines
+			.map((line, idx) => `<text x="20" y="${textY + idx * lineH}" fill="#d1d5db" font-size="14" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">${escapeXml(line)}</text>`)
+			.join("");
+		const markdownHeight = textY + textH + 24;
+		const markdownSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${markdownHeight}" viewBox="0 0 ${width} ${markdownHeight}"><rect x="0" y="0" width="${width}" height="${markdownHeight}" fill="#0b1020"/><rect x="0" y="0" width="${width}" height="${headerH}" fill="#111827"/><text x="20" y="34" fill="#e5e7eb" font-size="18" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">pi-visual · markdown</text>${textRows}</svg>`;
+		await writeAtomic(markdownSvgPath, markdownSvg);
+		state.latest.markdownPngPath = await convertSvgToPng(pi, ctx, markdownSvgPath, markdownPngPath);
+		state.renderCache.inline.markdownKey = markdownKey;
+		state.renderCache.inline.markdownPngPath = state.latest.markdownPngPath;
+	}
 
 	const chart = parseFirstNumericMarkdownTable(state.latest.text);
 	if (!chart) {
 		state.latest.chartPngPath = undefined;
+		state.renderCache.inline.chartKey = "";
+		state.renderCache.inline.chartPngPath = undefined;
+		state.latest.previewPngPath = pickPrimaryPreview(state.latest);
+		return;
+	}
+
+	const chartKey = hashText(JSON.stringify(chart));
+	const chartSvgPath = path.join(cacheDir, "latest-chart.svg");
+	const chartPngPath = path.join(cacheDir, "latest-chart.png");
+	if (state.renderCache.inline.chartKey === chartKey && (await fileExists(state.renderCache.inline.chartPngPath))) {
+		state.latest.chartPngPath = state.renderCache.inline.chartPngPath;
 		state.latest.previewPngPath = pickPrimaryPreview(state.latest);
 		return;
 	}
@@ -495,10 +589,10 @@ async function renderInlineAssets(pi: ExtensionAPI, ctx: ExtensionCommandContext
 	const chartHeight = 320;
 	const chartInner = renderChartSvg(chart, width, 64).svg;
 	const chartSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${chartHeight}" viewBox="0 0 ${width} ${chartHeight}"><rect x="0" y="0" width="${width}" height="${chartHeight}" fill="#0b1020"/><rect x="0" y="0" width="${width}" height="54" fill="#111827"/><text x="20" y="34" fill="#e5e7eb" font-size="18" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">pi-visual · chart</text>${chartInner}</svg>`;
-	const chartSvgPath = path.join(cacheDir, "latest-chart.svg");
-	const chartPngPath = path.join(cacheDir, "latest-chart.png");
 	await writeAtomic(chartSvgPath, chartSvg);
 	state.latest.chartPngPath = await convertSvgToPng(pi, ctx, chartSvgPath, chartPngPath);
+	state.renderCache.inline.chartKey = chartKey;
+	state.renderCache.inline.chartPngPath = state.latest.chartPngPath;
 	state.latest.previewPngPath = pickPrimaryPreview(state.latest);
 }
 
@@ -558,7 +652,7 @@ function buildInlineVisualMessage(latest: VisualSnapshot): string {
 
 async function buildInlineVisualContent(latest: VisualSnapshot): Promise<CustomMessageContent> {
 	const blocks: Array<CustomTextBlock | CustomImageBlock> = [{ type: "text", text: buildInlineVisualMessage(latest) }];
-	const candidates = [latest.previewPngPath, latest.renderedMermaidPngPath, latest.chartPngPath, latest.markdownPngPath].filter(
+	const candidates = [latest.markdownPngPath, latest.renderedMermaidPngPath, latest.chartPngPath, latest.previewPngPath].filter(
 		(v): v is string => Boolean(v),
 	);
 	const seen = new Set<string>();
@@ -584,17 +678,46 @@ async function publishInlineVisualMessage(pi: ExtensionAPI): Promise<void> {
 		.digest("hex");
 	if (inlineHash === state.lastInlineHash) return;
 	state.lastInlineHash = inlineHash;
-	const content = await buildInlineVisualContent(state.latest);
+
+	const latest = state.latest;
+	const summary = buildInlineVisualMessage(latest);
 	pi.sendMessage({
 		customType: "pi-visual-live",
-		content,
+		content: [{ type: "text", text: summary }],
 		display: true,
 		details: {
-			hash: state.latest.hash,
-			ts: state.latest.ts,
-			source: state.latest.source,
+			hash: latest.hash,
+			ts: latest.ts,
+			source: latest.source,
+			kind: "summary",
 		},
 	});
+
+	const candidates = [latest.markdownPngPath, latest.renderedMermaidPngPath, latest.chartPngPath, latest.previewPngPath].filter(
+		(v): v is string => Boolean(v),
+	);
+	const seen = new Set<string>();
+	for (const candidate of candidates) {
+		if (seen.has(candidate)) continue;
+		seen.add(candidate);
+		const image = await pathToImageBlock(candidate);
+		if (!image) continue;
+		pi.sendMessage({
+			customType: "pi-visual-live",
+			content: [
+				{ type: "text", text: `Preview: \`${candidate}\`` },
+				image,
+			],
+			display: true,
+			details: {
+				hash: latest.hash,
+				ts: latest.ts,
+				source: latest.source,
+				kind: "preview",
+				path: candidate,
+			},
+		});
+	}
 }
 
 async function openInspector(ctx: ExtensionCommandContext): Promise<void> {
@@ -706,8 +829,14 @@ async function rerenderAndVisualizeInline(
 	}
 }
 
-async function runVisualize(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	state.visualizeActive = !state.visualizeActive;
+async function runVisualize(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	mode: "on" | "off" | "toggle" = "on",
+): Promise<void> {
+	if (mode === "toggle") state.visualizeActive = !state.visualizeActive;
+	else state.visualizeActive = mode === "on";
+
 	updateWidget(ctx);
 	if (!state.visualizeActive) {
 		ctx.ui.notify("Live visualization off", "info");
@@ -715,9 +844,20 @@ async function runVisualize(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pro
 	}
 	if (!state.latest) {
 		ctx.ui.notify("Live visualization on (waiting for visual output)", "info");
+		await openInspector(ctx);
 		return;
 	}
 	await rerenderAndVisualizeInline(pi, ctx, true);
+	await openInspector(ctx);
+}
+
+function parseVisualizeMode(args: string): "on" | "off" | "toggle" {
+	const flag = args.trim().toLowerCase();
+	if (!flag) return "on";
+	if (["on", "start", "enable"].includes(flag)) return "on";
+	if (["off", "stop", "disable"].includes(flag)) return "off";
+	if (flag === "toggle") return "toggle";
+	return "on";
 }
 
 function registerCommandSafe(
@@ -743,7 +883,8 @@ export default function (pi: ExtensionAPI) {
 		if (!Array.isArray(content)) return new Markdown(String(content ?? ""), 1, 0, mdTheme);
 
 		const container = new Container();
-		const maxImages = expanded ? 4 : 1;
+		const totalImages = content.filter((b) => b?.type === "image").length;
+		const maxImages = expanded ? Math.max(4, totalImages) : Math.min(3, Math.max(1, totalImages));
 		let renderedImages = 0;
 		let hasAny = false;
 
@@ -781,14 +922,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const primary = registerCommandSafe(pi, state.commands.visualize, {
-		description: "Toggle live visualization for markdown/mermaid/chart output",
-		handler: async (_args, ctx) => runVisualize(pi, ctx),
+		description: "Enable live terminal visualization (args: on|off|toggle)",
+		handler: async (args, ctx) => runVisualize(pi, ctx, parseVisualizeMode(args)),
 	});
 	if (!primary) return;
 
 	registerCommandSafe(pi, state.commands.alias, {
-		description: "Alias for /pi-visualize toggle",
-		handler: async (_args, ctx) => runVisualize(pi, ctx),
+		description: "Alias for /pi-visualize (args: on|off|toggle)",
+		handler: async (args, ctx) => runVisualize(pi, ctx, parseVisualizeMode(args)),
 	});
 
 	registerCommandSafe(pi, state.commands.clear, {
@@ -798,6 +939,8 @@ export default function (pi: ExtensionAPI) {
 			state.lastHash = undefined;
 			state.lastInlineHash = undefined;
 			state.visualizeActive = false;
+			state.renderCache.mermaid = {};
+			state.renderCache.inline = {};
 			clearWidget(ctx);
 			updateWidget(ctx);
 			ctx.ui.notify("Cleared latest snapshot (live visualize off)", "info");
